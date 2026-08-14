@@ -2,6 +2,9 @@ import streamlit as st
 import os
 import tempfile
 import subprocess
+import platform
+import urllib.request
+import stat
 from math import sqrt
 
 st.set_page_config(
@@ -52,14 +55,25 @@ div[data-testid="stSidebar"] {
     margin-bottom: 0.5rem;
     font-weight: 700;
 }
-.result-box {
-    border: 1.5px dashed #c0bbb0;
-    padding: 1.5rem;
-    margin: 1rem 0;
-    background: #faf8f4;
-}
 </style>
 """, unsafe_allow_html=True)
+
+
+# --- Vina binary setup ---
+@st.cache_resource
+def get_vina_binary():
+    """Download and cache the AutoDock Vina binary."""
+    vina_dir = os.path.join(tempfile.gettempdir(), "vina_bin")
+    os.makedirs(vina_dir, exist_ok=True)
+    vina_path = os.path.join(vina_dir, "vina_1.2.5_linux_x86_64")
+
+    if not os.path.exists(vina_path):
+        url = "https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64"
+        urllib.request.urlretrieve(url, vina_path)
+        os.chmod(vina_path, os.stat(vina_path).st_mode | stat.S_IEXEC)
+
+    return vina_path
+
 
 # --- Helper Functions ---
 
@@ -174,25 +188,46 @@ def convert_to_pdbqt(pdb_path, pdbqt_path):
     return pdbqt_path
 
 
-def run_docking(receptor_pdbqt, ligand_pdbqt, center, box_size, exhaustiveness=32, n_poses=10):
-    """Run AutoDock Vina docking."""
-    from vina import Vina
+def run_docking(vina_bin, receptor_pdbqt, ligand_pdbqt, center, box_size,
+                output_path, exhaustiveness=32, n_poses=10):
+    """Run AutoDock Vina docking via CLI binary."""
+    cmd = [
+        vina_bin,
+        "--receptor", receptor_pdbqt,
+        "--ligand", ligand_pdbqt,
+        "--center_x", str(center[0]),
+        "--center_y", str(center[1]),
+        "--center_z", str(center[2]),
+        "--size_x", str(box_size[0]),
+        "--size_y", str(box_size[1]),
+        "--size_z", str(box_size[2]),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", str(n_poses),
+        "--out", output_path,
+    ]
 
-    v = Vina(sf_name='vina', cpu=4)
-    v.set_receptor(receptor_pdbqt)
-    v.set_ligand_from_file(ligand_pdbqt)
-    v.compute_vina_maps(center=center, box_size=box_size)
-    v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
-    poses_path = os.path.join(os.path.dirname(ligand_pdbqt), "docked_poses.pdbqt")
-    v.write_poses(poses_path, n_poses=n_poses)
-    energies = v.energies()
+    if result.returncode != 0:
+        raise RuntimeError(f"Vina docking failed:\n{result.stderr}")
 
-    return energies, poses_path
+    # Parse energies from the output PDBQT file
+    energies = []
+    with open(output_path) as f:
+        for line in f:
+            if line.startswith("REMARK VINA RESULT:"):
+                parts = line.split()
+                # REMARK VINA RESULT:  energy  rmsd_lb  rmsd_ub
+                energy = float(parts[3])
+                rmsd_lb = float(parts[4])
+                rmsd_ub = float(parts[5])
+                energies.append((energy, rmsd_lb, rmsd_ub))
+
+    return energies, output_path
 
 
 def extract_poses(poses_pdbqt_path, output_dir, best_only=False):
-    """Extract docked poses to PDB files."""
+    """Extract docked poses to PDB files using Meeko."""
     from meeko import PDBQTMolecule, RDKitMolCreate
     from rdkit import Chem
 
@@ -216,7 +251,7 @@ st.markdown("# Vina Plug & Play")
 st.markdown("**Interactive molecular docking with AutoDock Vina** — no programming required.")
 st.markdown("---")
 
-# Sidebar with info
+# Sidebar
 with st.sidebar:
     st.markdown("### How it works")
     st.markdown("""
@@ -233,7 +268,7 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# Create a temp directory for this session
+# Temp directory for session
 if "work_dir" not in st.session_state:
     st.session_state.work_dir = tempfile.mkdtemp()
 work_dir = st.session_state.work_dir
@@ -324,6 +359,10 @@ if st.button("Run Docking", disabled=not can_run, type="primary"):
     progress = st.progress(0, text="Initializing...")
 
     try:
+        # 0. Get vina binary
+        progress.progress(5, text="Setting up AutoDock Vina...")
+        vina_bin = get_vina_binary()
+
         # 1. Prepare ligand
         progress.progress(10, text="Preparing ligand...")
         if ligand_pdbqt is None:
@@ -368,7 +407,9 @@ if st.button("Run Docking", disabled=not can_run, type="primary"):
         box_dim = 2 * pocket_radius
         box_size = [box_dim, box_dim, box_dim]
         progress.progress(65, text="Running AutoDock Vina (this may take a few minutes)...")
-        energies, poses_path = run_docking(receptor_pdbqt, ligand_pdbqt, center, box_size,
+        poses_path = os.path.join(work_dir, "docked_poses.pdbqt")
+        energies, poses_path = run_docking(vina_bin, receptor_pdbqt, ligand_pdbqt,
+                                           center, box_size, poses_path,
                                            exhaustiveness=exhaustiveness, n_poses=n_poses)
 
         progress.progress(90, text="Extracting poses...")
@@ -389,14 +430,14 @@ if st.button("Run Docking", disabled=not can_run, type="primary"):
         for i, e in enumerate(energies):
             energy_data.append({
                 "Pose": i + 1,
-                "Total": f"{e[0]:.2f}",
-                "Intermolecular": f"{e[1]:.2f}",
-                "Intramolecular": f"{e[2]:.2f}",
+                "Affinity": f"{e[0]:.2f}",
+                "RMSD l.b.": f"{e[1]:.2f}",
+                "RMSD u.b.": f"{e[2]:.2f}",
             })
         df = pd.DataFrame(energy_data)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
-        st.success(f"Best binding energy: **{energies[0][0]:.2f} kcal/mol**")
+        st.success(f"Best binding affinity: **{energies[0][0]:.2f} kcal/mol**")
 
         # Download buttons
         st.markdown("**Download Results**")
@@ -411,8 +452,6 @@ if st.button("Run Docking", disabled=not can_run, type="primary"):
                 with open(pose_files[0], "r") as f:
                     st.download_button("Download best pose (.pdb)", f.read(),
                                        file_name="best_pose.pdb", mime="chemical/x-pdb")
-
-        st.session_state.docking_complete = True
 
     except Exception as e:
         progress.empty()
