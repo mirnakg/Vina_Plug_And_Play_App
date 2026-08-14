@@ -1,0 +1,9 @@
+streamlit
+vina
+rdkit
+meeko
+openbabel-wheel
+gemmi
+biopandas
+requests
+pandas
