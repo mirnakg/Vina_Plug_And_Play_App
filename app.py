@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import tempfile
 import subprocess
-import platform
 import urllib.request
 import stat
 from math import sqrt
@@ -75,29 +74,27 @@ def get_vina_binary():
     return vina_path
 
 
-# --- Helper Functions ---
+# --- Helper Functions (all conversions via Open Babel CLI) ---
 
 def smiles_to_pdbqt(smiles, output_path):
-    """Convert SMILES string to PDBQT using RDKit + Meeko."""
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-    import meeko
+    """Convert SMILES to 3D PDBQT using Open Babel."""
+    # Step 1: SMILES -> 3D SDF (with hydrogen addition and geometry optimization)
+    sdf_path = output_path.replace(".pdbqt", ".sdf")
+    result = subprocess.run(
+        ["obabel", f"-:{smiles}", "-osdf", "-O", sdf_path,
+         "--gen3d", "-h"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not os.path.exists(sdf_path):
+        raise ValueError(f"Could not generate 3D structure from SMILES: {result.stderr}")
 
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("Invalid SMILES string. Please check and try again.")
-
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol, AllChem.ETKDGv3())
-    AllChem.MMFFOptimizeMolecule(mol)
-
-    preparator = meeko.MoleculePreparation()
-    mol_setup = preparator.prepare(mol)[0]
-    pdbqt_result_tuple = meeko.PDBQTWriterLegacy.write_string(mol_setup)
-    pdbqt_string = pdbqt_result_tuple[0]
-
-    with open(output_path, "w") as f:
-        f.write(pdbqt_string)
+    # Step 2: SDF -> PDBQT
+    result = subprocess.run(
+        ["obabel", sdf_path, "-O", output_path, "-xh"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0 or not os.path.exists(output_path):
+        raise ValueError(f"Could not convert to PDBQT: {result.stderr}")
 
     return output_path
 
@@ -217,7 +214,6 @@ def run_docking(vina_bin, receptor_pdbqt, ligand_pdbqt, center, box_size,
         for line in f:
             if line.startswith("REMARK VINA RESULT:"):
                 parts = line.split()
-                # REMARK VINA RESULT:  energy  rmsd_lb  rmsd_ub
                 energy = float(parts[3])
                 rmsd_lb = float(parts[4])
                 rmsd_ub = float(parts[5])
@@ -226,20 +222,42 @@ def run_docking(vina_bin, receptor_pdbqt, ligand_pdbqt, center, box_size,
     return energies, output_path
 
 
-def extract_poses(poses_pdbqt_path, output_dir, best_only=False):
-    """Extract docked poses to PDB files using Meeko."""
-    from meeko import PDBQTMolecule, RDKitMolCreate
-    from rdkit import Chem
+def extract_poses_to_pdb(poses_pdbqt_path, output_dir, best_only=False):
+    """Extract docked poses from PDBQT to individual PDB files using Open Babel."""
+    # Split multi-model PDBQT into individual models
+    models = []
+    current_model = []
+    with open(poses_pdbqt_path) as f:
+        for line in f:
+            if line.startswith("MODEL"):
+                current_model = []
+            elif line.startswith("ENDMDL"):
+                models.append("".join(current_model))
+            else:
+                current_model.append(line)
 
-    pdbqt_mol = PDBQTMolecule.from_file(poses_pdbqt_path)
+    if not models and current_model:
+        models.append("".join(current_model))
+
     pose_files = []
-    for i, pose in enumerate(pdbqt_mol):
-        rd_mol = RDKitMolCreate.from_pdbqt_mol(pose)[0]
-        pose_path = os.path.join(output_dir, f"pose_{i+1}.pdb")
-        Chem.MolToPDBFile(rd_mol, pose_path)
-        pose_files.append(pose_path)
+    for i, model_content in enumerate(models):
+        single_pdbqt = os.path.join(output_dir, f"pose_{i+1}.pdbqt")
+        pose_pdb = os.path.join(output_dir, f"pose_{i+1}.pdb")
+
+        with open(single_pdbqt, "w") as f:
+            f.write(model_content)
+
+        subprocess.run(
+            ["obabel", single_pdbqt, "-O", pose_pdb],
+            capture_output=True, text=True
+        )
+
+        if os.path.exists(pose_pdb):
+            pose_files.append(pose_pdb)
+
         if best_only:
             break
+
     return pose_files
 
 
@@ -414,8 +432,8 @@ if st.button("Run Docking", disabled=not can_run, type="primary"):
 
         progress.progress(90, text="Extracting poses...")
 
-        # 7. Extract poses
-        pose_files = extract_poses(poses_path, work_dir, best_only=False)
+        # 7. Extract poses to PDB
+        pose_files = extract_poses_to_pdb(poses_path, work_dir, best_only=False)
 
         progress.progress(100, text="Done!")
 
