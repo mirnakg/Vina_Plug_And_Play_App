@@ -1,7 +1,7 @@
 streamlit
-vina
-rdkit
-meeko
+vina==1.2.5
+rdkit-pypi
+meeko>=0.5.0
 openbabel-wheel
 gemmi
 biopandas
